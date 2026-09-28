@@ -79,6 +79,8 @@ add_library(
 	u_pacing_compositor_fake.c
 	u_pretty_print.c
 	u_pretty_print.h
+	u_psvr2_optical.c
+	u_psvr2_optical.h
 	u_prober.c
 	u_prober.h
 	u_resampler.c

@@ -387,7 +387,10 @@ public:
 		m_pose = {};
 
 		snprintf(m_sModelNumber, MODELNUM_LEN, "[Monado] %s", xdev->str);
-		strncpy(m_sSerialNumber, xdev->serial, XRT_DEVICE_NAME_LEN);
+		snprintf(m_sSerialNumber,
+		         sizeof(m_sSerialNumber),
+		         "%s",
+		         xdev->serial[0] != '\0' ? xdev->serial : xdev->str);
 
 		switch (this->m_xdev->name) {
 		case XRT_DEVICE_INDEX_CONTROLLER:
@@ -873,6 +876,8 @@ public:
 			grip_name = XRT_INPUT_TOUCH_GRIP_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_SIMPLE_CONTROLLER) {
 			grip_name = XRT_INPUT_SIMPLE_GRIP_POSE;
+		} else if (m_xdev->name == XRT_DEVICE_PSSENSE) {
+			grip_name = XRT_INPUT_PSSENSE_GRIP_POSE;
 		} else {
 			ovrd_log("Unhandled device name %u\n", m_xdev->name);
 			grip_name = XRT_INPUT_GENERIC_HEAD_POSE; // ???

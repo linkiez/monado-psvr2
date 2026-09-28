@@ -19,6 +19,7 @@
 #include "tracking/t_imu.h"
 
 #include "util/u_var.h"
+#include "util/u_psvr2_optical.h"
 #include "util/u_debug.h"
 #include "util/u_device.h"
 #include "util/u_logging.h"
@@ -757,6 +758,7 @@ pssense_get_fusion_pose(struct pssense_device *pssense,
 	out_relation->relation_flags = (enum xrt_space_relation_flags)(
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
 	    XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
+
 }
 
 static xrt_result_t
@@ -787,6 +789,13 @@ pssense_get_tracked_pose(struct xrt_device *xdev,
 	os_mutex_unlock(&pssense->lock);
 
 	m_relation_chain_resolve(&xrc, out_relation);
+
+	struct xrt_vec3 optical_position;
+	if (u_psvr2_optical_get_position(pssense->hand == PSSENSE_HAND_RIGHT, at_timestamp_ns, &optical_position)) {
+		out_relation->pose.position = optical_position;
+		out_relation->relation_flags |=
+		    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
+	}
 
 	return XRT_SUCCESS;
 }
@@ -898,6 +907,7 @@ pssense_found(struct xrt_prober *xp,
 	pssense->base.get_battery_status = pssense_get_battery_status;
 	pssense->base.destroy = pssense_device_destroy;
 	pssense->base.supported.orientation_tracking = true;
+	pssense->base.supported.position_tracking = u_psvr2_optical_is_enabled();
 	pssense->base.supported.battery_status = true;
 
 	pssense->base.binding_profiles = binding_profiles_pssense;

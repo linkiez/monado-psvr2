@@ -39,6 +39,7 @@
 #include "util/u_trace_marker.h"
 #include "util/u_var.h"
 #include "util/u_debug.h"
+#include "util/u_psvr2_optical.h"
 
 #include <stdio.h>
 #include <assert.h>
@@ -59,6 +60,8 @@
 
 #define USB_CAM_MODE10_XFER_SIZE 1040640
 #define USB_CAM_MODE1_XFER_SIZE 819456
+#define USB_CAM_MODE10_OPTICAL_WIDTH 512
+#define USB_CAM_MODE10_OPTICAL_HEIGHT 508
 #define NUM_CAM_XFERS 1
 
 #define SERIAL_LENGTH 14
@@ -149,6 +152,7 @@ struct psvr2_hmd
 	struct libusb_transfer *slam_xfer;
 	/* Camera (bulk) transfers */
 	struct libusb_transfer *camera_xfers[NUM_CAM_XFERS];
+	uint8_t *camera_mode10_optical_frame;
 	/* LD EP9 (bulk) transfer */
 	struct libusb_transfer *led_detector_xfer;
 	/* RP EP10 (bulk) transfer */
@@ -246,6 +250,7 @@ psvr2_hmd_destroy(struct xrt_device *xdev)
     os_thread_helper_destroy(&hmd->usb_thread);
 
 	psvr2_usb_destroy(hmd);
+	free(hmd->camera_mode10_optical_frame);
 
 	if (hmd->dev != NULL) {
 		libusb_close(hmd->dev);
@@ -496,21 +501,48 @@ status_xfer_cb(struct libusb_transfer *xfer)
 	os_mutex_unlock(&hmd->data_lock);
 }
 
+static void
+process_mode10_optical_frame(struct psvr2_hmd *hmd, const uint8_t *buffer, int64_t timestamp_ns)
+{
+	if (!u_psvr2_optical_is_enabled() || hmd->camera_mode10_optical_frame == NULL) {
+		return;
+	}
+
+	const uint8_t *src = buffer + 256;
+	uint8_t *dst = hmd->camera_mode10_optical_frame;
+	for (uint32_t y = 0; y < USB_CAM_MODE10_OPTICAL_HEIGHT; y++) {
+		for (uint32_t x = 0; x < 254; x++) {
+			dst[2 * x] = src[8 * x];
+			dst[2 * x + 1] = src[8 * x + 1];
+		}
+		src += (254 * 8) + 16;
+		dst += USB_CAM_MODE10_OPTICAL_WIDTH;
+	}
+
+	u_psvr2_optical_process_frame(hmd->camera_mode10_optical_frame,
+	                              USB_CAM_MODE10_OPTICAL_WIDTH,
+	                              USB_CAM_MODE10_OPTICAL_HEIGHT,
+	                              USB_CAM_MODE10_OPTICAL_WIDTH,
+	                              timestamp_ns);
+}
+
 static void LIBUSB_CALL
 img_xfer_cb(struct libusb_transfer *xfer)
 {
 	DRV_TRACE_MARKER();
 
+	struct psvr2_hmd *hmd = xfer->user_data;
+	PSVR2_TRACE(hmd, "Camera transfer callback status %d, %d bytes", xfer->status, xfer->actual_length);
 	if (!hmd_usb_xfer_continue(xfer, "Camera frame")) {
 		return;
 	}
 
-	struct psvr2_hmd *hmd = xfer->user_data;
 	if (xfer->actual_length > 0) {
 		PSVR2_TRACE(hmd, "Camera frame - %d bytes", xfer->actual_length);
 		PSVR2_TRACE_HEX(hmd, xfer->buffer, MIN(256, xfer->actual_length));
 
 		if (xfer->actual_length == USB_CAM_MODE10_XFER_SIZE) {
+			process_mode10_optical_frame(hmd, xfer->buffer, os_monotonic_get_ns());
 			for (int d = 0; d < 3; d++) {
 				if (u_sink_debug_is_active(&hmd->debug_sinks[d])) {
 					struct xrt_frame *xf = NULL;
@@ -551,6 +583,7 @@ img_xfer_cb(struct libusb_transfer *xfer)
 				}
 			}
 		} else if (xfer->actual_length == USB_CAM_MODE1_XFER_SIZE) {
+			u_psvr2_optical_process_frame(xfer->buffer + 256, 1280, 640, 1280, os_monotonic_get_ns());
 			if (u_sink_debug_is_active(&hmd->debug_sinks[3])) {
 
 				struct xrt_frame *xf = NULL;
@@ -567,7 +600,10 @@ img_xfer_cb(struct libusb_transfer *xfer)
 	}
 
 	os_mutex_lock(&hmd->data_lock);
-	libusb_submit_transfer(xfer);
+	int res = libusb_submit_transfer(xfer);
+	if (res < 0) {
+		PSVR2_ERROR(hmd, "Could not resubmit camera transfer: %s", libusb_strerror(res));
+	}
 	os_mutex_unlock(&hmd->data_lock);
 }
 
@@ -723,6 +759,7 @@ process_slam_record(struct psvr2_hmd *hmd, uint8_t *buf, int bytes_read)
         m_relation_history_estimate_motion(hmd->relation_history, &relation, pose_sample.timestamp_ns, &relation);
 
         m_relation_history_push(hmd->relation_history, &relation, pose_sample.timestamp_ns);
+        u_psvr2_optical_publish_hmd_pose(&pose_for_history, pose_timestamp);
 }
 
 static void LIBUSB_CALL
@@ -919,7 +956,9 @@ toggle_camera_enable(struct psvr2_hmd *hmd)
 	         hmd->camera_enable ? "Disable camera streams" : "Enable camera streams");
 
 	if (hmd->camera_enable) {
-		set_camera_mode(hmd, hmd->camera_mode);
+		if (!set_camera_mode(hmd, hmd->camera_mode)) {
+			PSVR2_ERROR(hmd, "Could not start camera stream in mode 0x%x", hmd->camera_mode);
+		}
 	} else {
 		set_camera_mode(hmd, PSVR2_CAMERA_MODE_OFF);
 	}
@@ -1017,7 +1056,9 @@ cycle_camera_mode(struct psvr2_hmd *hmd)
 	}
 
 	if (hmd->camera_enable) {
-		set_camera_mode(hmd, hmd->camera_mode);
+		if (!set_camera_mode(hmd, hmd->camera_mode)) {
+			PSVR2_ERROR(hmd, "Could not start camera stream in mode 0x%x", hmd->camera_mode);
+		}
 	} else {
 		set_camera_mode(hmd, PSVR2_CAMERA_MODE_OFF);
 	}
@@ -1053,7 +1094,6 @@ psvr2_usb_start(struct psvr2_hmd *hmd)
 	/* Camera data */
 	hmd->camera_enable = true;
 	hmd->camera_mode = PSVR2_CAMERA_MODE_10;
-	set_camera_mode(hmd, hmd->camera_mode);
 
 	for (int i = 0; i < NUM_CAM_XFERS; i++) {
 		hmd->camera_xfers[i] = libusb_alloc_transfer(0);
@@ -1075,7 +1115,6 @@ psvr2_usb_start(struct psvr2_hmd *hmd)
 		}
 		hmd->usb_active_xfers++;
 	}
-
 	/* SLAM endpoint */
 	hmd->slam_xfer = libusb_alloc_transfer(0);
 	if (hmd->slam_xfer == NULL) {
@@ -1148,6 +1187,18 @@ psvr2_usb_start(struct psvr2_hmd *hmd)
 	}
 	hmd->usb_active_xfers++;
 
+	if (u_psvr2_optical_is_enabled()) {
+		hmd->camera_mode10_optical_frame =
+		    calloc(USB_CAM_MODE10_OPTICAL_WIDTH * USB_CAM_MODE10_OPTICAL_HEIGHT, 1);
+		if (hmd->camera_mode10_optical_frame == NULL) {
+			PSVR2_ERROR(hmd, "Could not allocate mode 0x10 optical frame buffer");
+			goto out;
+		}
+	}
+
+	if (!set_camera_mode(hmd, hmd->camera_mode)) {
+		PSVR2_ERROR(hmd, "Could not start camera stream in mode 0x%x", hmd->camera_mode);
+	}
 
 	result = true;
 

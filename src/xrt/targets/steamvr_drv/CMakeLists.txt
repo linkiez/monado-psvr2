@@ -65,6 +65,10 @@ set_target_properties(driver_monado PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${PLUGI
 # don't add lib prefix to driver_monado.so
 set_target_properties(driver_monado PROPERTIES PREFIX "")
 
+if(UNIX AND NOT APPLE)
+	set_target_properties(driver_monado PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+endif()
+
 install(
 	DIRECTORY "${PROJECT_BINARY_DIR}/steamvr-monado"
 	DESTINATION "${CMAKE_INSTALL_PREFIX}/share"
